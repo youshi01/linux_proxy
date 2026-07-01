@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+.env
+proxy_subscriptions.json
+proxy_mode.json
+v2rayn_subscription.txt
+v2rayn_subscription_raw.txt
+xray_proxy_config.json
+xray_proxy_config.json.bak.*
+.install_xray_*.sh

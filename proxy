@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+"""
+通用版代理管理脚本
+- 订阅管理
+- 节点切换
+- 三种代理模式（仅入站 / 仅出站 / 全局）
+- 自动识别常见官方 Xray / V2Ray 安装路径
+- 可一键拉取官方 Xray 安装脚本并安装
+"""
+
+import base64
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+BASE_DIR = Path(__file__).resolve().parent
+SUBS_FILE = str(BASE_DIR / "proxy_subscriptions.json")
+MODE_FILE = str(BASE_DIR / "proxy_mode.json")
+PROXY_SH = "/etc/profile.d/xray-proxy.sh"
+ENV_FILE = "/etc/environment"
+SOCKS_PORT = 10808
+HTTP_PORT = 10809
+DEFAULT_MODE = "inbound"
+
+DEFAULT_SUBSCRIPTIONS = []
+
+MODE_LABELS = {
+    "inbound": "仅入站代理",
+    "outbound": "仅出站代理",
+    "global": "全局代理",
+}
+
+PROXY_ENV_LINES = [
+    f"HTTP_PROXY=http://127.0.0.1:{HTTP_PORT}",
+    f"HTTPS_PROXY=http://127.0.0.1:{HTTP_PORT}",
+    f"ALL_PROXY=socks5h://127.0.0.1:{SOCKS_PORT}",
+    f"http_proxy=http://127.0.0.1:{HTTP_PORT}",
+    f"https_proxy=http://127.0.0.1:{HTTP_PORT}",
+    f"all_proxy=socks5h://127.0.0.1:{SOCKS_PORT}",
+]
+
+SERVICE_CANDIDATES = ["xray-proxy", "xray", "v2ray", "v2ray-proxy"]
+CONFIG_CANDIDATES = [
+    str(BASE_DIR / "xray_proxy_config.json"),
+    "/usr/local/etc/xray/config.json",
+    "/etc/xray/config.json",
+    "/usr/local/etc/v2ray/config.json",
+    "/etc/v2ray/config.json",
+]
+
+ACTION_TOKENS = {
+    "000", "00", "001", "002", "01", "02", "03", "04", "05",
+    "0", "06", "off", "stop", "on", "start", "test", "check"
+}
+
+
+def run(cmd, **kwargs):
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+def base_config():
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": SOCKS_PORT,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True},
+            },
+            {
+                "listen": "127.0.0.1",
+                "port": HTTP_PORT,
+                "protocol": "http",
+                "settings": {},
+            },
+        ],
+        "outbounds": [],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [{"type": "field", "outboundTag": "", "port": "0-65535"}],
+        },
+    }
+
+
+def ensure_subscriptions_file():
+    path = Path(SUBS_FILE)
+    if not path.exists():
+        path.write_text(json.dumps(DEFAULT_SUBSCRIPTIONS, indent=2, ensure_ascii=False) + "\n")
+
+
+def load_subscriptions():
+    ensure_subscriptions_file()
+    try:
+        data = json.loads(Path(SUBS_FILE).read_text())
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return DEFAULT_SUBSCRIPTIONS.copy()
+
+
+def save_subscriptions(items):
+    Path(SUBS_FILE).write_text(json.dumps(items, indent=2, ensure_ascii=False) + "\n")
+
+
+def ensure_mode_file():
+    path = Path(MODE_FILE)
+    if not path.exists():
+        path.write_text(json.dumps({"mode": DEFAULT_MODE}, ensure_ascii=False) + "\n")
+
+
+def get_mode():
+    ensure_mode_file()
+    try:
+        data = json.loads(Path(MODE_FILE).read_text())
+        mode = data.get("mode", DEFAULT_MODE)
+        if mode in MODE_LABELS:
+            return mode
+    except Exception:
+        pass
+    return DEFAULT_MODE
+
+
+def save_mode(mode):
+    Path(MODE_FILE).write_text(json.dumps({"mode": mode}, ensure_ascii=False) + "\n")
+
+
+def parse_config_path_from_unit(text):
+    patterns = [
+        r"-config\s+(\S+)",
+        r"\s-c\s+(\S+)",
+        r"\sconfig\s+(\S+\.json)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def detect_runtime():
+    for service in SERVICE_CANDIDATES:
+        r = run(["systemctl", "cat", service], timeout=8)
+        if r.returncode == 0:
+            cfg = parse_config_path_from_unit(r.stdout)
+            if cfg:
+                return {"service": service, "config_file": cfg, "source": "systemd"}
+            for candidate in CONFIG_CANDIDATES:
+                if Path(candidate).exists():
+                    return {"service": service, "config_file": candidate, "source": "mixed"}
+            return {"service": service, "config_file": CONFIG_CANDIDATES[0], "source": "systemd"}
+
+    for candidate in CONFIG_CANDIDATES:
+        if Path(candidate).exists():
+            guessed = "xray" if "xray" in candidate else "v2ray"
+            return {"service": guessed, "config_file": candidate, "source": "path"}
+
+    return {"service": "xray", "config_file": CONFIG_CANDIDATES[1], "source": "default"}
+
+
+def load_config():
+    runtime = detect_runtime()
+    path = Path(runtime["config_file"])
+    if not path.exists():
+        return base_config()
+    with open(path) as f:
+        return json.load(f)
+
+
+def backup_config(path):
+    p = Path(path)
+    if not p.exists():
+        return
+    backup = p.with_name(p.name + f".bak.{int(time.time())}")
+    shutil.copy2(p, backup)
+
+
+def save_config(cfg):
+    runtime = detect_runtime()
+    path = Path(runtime["config_file"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup_config(path)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def get_nodes():
+    return load_config().get("outbounds", [])
+
+
+def get_current_tag():
+    rules = load_config().get("routing", {}).get("rules", [])
+    return rules[0].get("outboundTag", "unknown") if rules else "unknown"
+
+
+def resolve_tag(arg):
+    nodes = get_nodes()
+    try:
+        idx = int(arg) - 1
+        if 0 <= idx < len(nodes):
+            return nodes[idx]["tag"]
+    except ValueError:
+        pass
+    valid_tags = [n["tag"] for n in nodes]
+    if arg in valid_tags:
+        return arg
+    return None
+
+
+def check_service():
+    runtime = detect_runtime()
+    try:
+        r = run(["systemctl", "is-active", runtime["service"]], timeout=5)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+def cleanup_env_file():
+    if os.path.exists(PROXY_SH):
+        os.remove(PROXY_SH)
+
+
+def remove_env_vars_from_text(text):
+    lines = text.splitlines()
+    filtered = []
+    keys = {line.split("=", 1)[0] for line in PROXY_ENV_LINES}
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(k + "=") for k in keys):
+            continue
+        filtered.append(line)
+    return "\n".join(filtered).strip("\n")
+
+
+def write_profile_env_file():
+    content = "\n".join([f"export {line}" for line in PROXY_ENV_LINES]) + "\n"
+    with open(PROXY_SH, "w") as f:
+        f.write(content)
+
+
+def write_global_env_file():
+    existing = Path(ENV_FILE).read_text() if os.path.exists(ENV_FILE) else ""
+    cleaned = remove_env_vars_from_text(existing)
+    final = (cleaned + "\n" if cleaned else "") + "\n".join(PROXY_ENV_LINES) + "\n"
+    Path(ENV_FILE).write_text(final)
+
+
+def clear_global_env_file():
+    if not os.path.exists(ENV_FILE):
+        return
+    existing = Path(ENV_FILE).read_text()
+    cleaned = remove_env_vars_from_text(existing)
+    Path(ENV_FILE).write_text((cleaned + "\n") if cleaned else "")
+
+
+def apply_mode(mode):
+    cleanup_env_file()
+    clear_global_env_file()
+    if mode == "outbound":
+        write_profile_env_file()
+    elif mode == "global":
+        write_profile_env_file()
+        write_global_env_file()
+    save_mode(mode)
+
+
+def unique_tag(tag, seen):
+    base = tag or "NODE"
+    if base not in seen:
+        seen.add(base)
+        return base
+    i = 2
+    while f"{base}-{i}" in seen:
+        i += 1
+    final = f"{base}-{i}"
+    seen.add(final)
+    return final
+
+
+def fetch_subscription_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", "ignore").strip()
+    try:
+        return base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
+    except Exception:
+        return raw
+
+
+def build_vless_outbound(uri, seen_tags):
+    u = urlparse(uri)
+    if u.scheme.lower() != "vless":
+        return None
+    q = parse_qs(u.query)
+    tag = unique_tag(unquote(u.fragment) if u.fragment else (u.hostname or "NODE"), seen_tags)
+    host = q.get("host", [""])[0]
+    path = q.get("path", [""])[0] or q.get("spx", [""])[0] or "/"
+    flow = q.get("flow", [""])[0]
+    fingerprint = q.get("fp", [""])[0] or "chrome"
+    sni = q.get("sni", [""])[0] or q.get("servername", [""])[0]
+    network = q.get("type", ["tcp"])[0]
+
+    outbound = {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": u.hostname or "",
+                    "port": u.port or 0,
+                    "users": [
+                        {
+                            "id": u.username or "",
+                            "encryption": q.get("encryption", ["none"])[0],
+                            "flow": flow,
+                        }
+                    ],
+                }
+            ]
+        },
+        "streamSettings": {
+            "network": network,
+            "security": q.get("security", [""])[0],
+            "realitySettings": {
+                "serverName": sni,
+                "fingerprint": fingerprint,
+                "publicKey": q.get("pbk", [""])[0],
+                "shortId": q.get("sid", [""])[0],
+                "spiderX": q.get("spx", ["/"])[0] or "/",
+            },
+        },
+        "tag": tag,
+    }
+
+    if network == "tcp":
+        outbound["streamSettings"]["tcpSettings"] = {"header": {"type": "none"}}
+    elif network == "ws":
+        outbound["streamSettings"]["wsSettings"] = {"path": path, "headers": {"Host": host}}
+    elif network == "grpc":
+        outbound["streamSettings"]["grpcSettings"] = {"serviceName": path.lstrip("/")}
+    return outbound
+
+
+def import_from_subscriptions(verbose=True):
+    subs = [s for s in load_subscriptions() if s.get("enabled", True) and s.get("url")]
+    if not subs:
+        print("没有可用订阅，请先执行: proxy 00 <订阅链接>")
+        return False
+
+    all_nodes = []
+    seen_tags = set()
+    for sub in subs:
+        try:
+            text = fetch_subscription_text(sub["url"])
+            lines = [x.strip() for x in text.splitlines() if x.strip()]
+            imported = 0
+            for line in lines:
+                node = build_vless_outbound(line, seen_tags)
+                if node:
+                    all_nodes.append(node)
+                    imported += 1
+            if verbose:
+                print(f"订阅 [{sub.get('name') or '未命名'}] 已更新，导入 {imported} 个节点")
+        except urllib.error.HTTPError as e:
+            print(f"订阅 [{sub.get('name') or '未命名'}] 更新失败: HTTP {e.code}")
+        except Exception as e:
+            print(f"订阅 [{sub.get('name') or '未命名'}] 更新失败: {e}")
+
+    if not all_nodes:
+        print("没有从订阅中导入任何可用节点")
+        return False
+
+    old = load_config()
+    cfg = base_config()
+    cfg["outbounds"] = all_nodes
+    current = old.get("routing", {}).get("rules", [{}])[0].get("outboundTag", "") if old else ""
+    valid_tags = [n["tag"] for n in all_nodes]
+    selected = current if current in valid_tags else valid_tags[0]
+    cfg["routing"]["rules"][0]["outboundTag"] = selected
+    save_config(cfg)
+    if verbose:
+        print(f"已写入 {len(all_nodes)} 个节点，当前节点: {selected}")
+    return True
+
+
+def outbound_to_vless_uri(node):
+    try:
+        import urllib.parse
+        tag = node.get("tag", "NODE")
+        vnext = node.get("settings", {}).get("vnext", [{}])[0]
+        user = vnext.get("users", [{}])[0]
+        stream = node.get("streamSettings", {})
+        reality = stream.get("realitySettings", {})
+        params = {
+            "encryption": user.get("encryption", "none"),
+            "type": stream.get("network", "tcp"),
+            "security": stream.get("security", ""),
+            "flow": user.get("flow", ""),
+            "pbk": reality.get("publicKey", ""),
+            "sid": reality.get("shortId", ""),
+            "sni": reality.get("serverName", ""),
+            "fp": reality.get("fingerprint", ""),
+            "spx": reality.get("spiderX", "/"),
+        }
+        query = "&".join([f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items() if str(v) != ""])
+        return f"vless://{user.get('id','')}@{vnext.get('address','')}:{vnext.get('port',0)}?{query}#{urllib.parse.quote(tag)}"
+    except Exception:
+        return None
+
+
+def export_v2rayn_subscription():
+    nodes = get_nodes()
+    if not nodes:
+        print("当前没有可导出的节点")
+        return
+    lines = []
+    for node in nodes:
+        uri = outbound_to_vless_uri(node)
+        if uri:
+            lines.append(uri)
+    if not lines:
+        print("没有可导出的 vless 节点")
+        return
+    raw_path = BASE_DIR / "v2rayn_subscription_raw.txt"
+    b64_path = BASE_DIR / "v2rayn_subscription.txt"
+    raw_text = "\n".join(lines) + "\n"
+    raw_path.write_text(raw_text)
+    b64_path.write_text(base64.b64encode(raw_text.encode()).decode() + "\n")
+    print("已导出 v2rayN 订阅:")
+    print(f"  原始链接: {raw_path}")
+    print(f"  Base64订阅: {b64_path}")
+
+
+def add_subscription(url, name=None):
+    subs = load_subscriptions()
+    for item in subs:
+        if item.get("url") == url:
+            print("订阅已存在，开始更新...")
+            return import_from_subscriptions(verbose=True)
+    if not name:
+        parsed = urlparse(url)
+        name = parsed.netloc or f"sub-{len(subs)+1}"
+    subs.append({"name": name, "url": url, "enabled": True})
+    save_subscriptions(subs)
+    print(f"已添加订阅: {name}")
+    return import_from_subscriptions(verbose=True)
+
+
+def list_subscriptions():
+    subs = load_subscriptions()
+    print(f"\n{'='*56}")
+    print("  订阅列表")
+    print(f"{'='*56}")
+    if not subs:
+        print("  (空)")
+    for i, sub in enumerate(subs, 1):
+        status = "启用" if sub.get("enabled", True) else "禁用"
+        print(f"  {i}. [{status}] {sub.get('name') or '未命名'}")
+        print(f"     {sub.get('url', '')}")
+    print(f"{'='*56}\n")
+
+
+def remove_subscription(index_text):
+    subs = load_subscriptions()
+    if not subs:
+        print("没有可删除的订阅")
+        return False
+    try:
+        idx = int(index_text) - 1
+    except ValueError:
+        print("订阅编号必须是数字")
+        return False
+    if idx < 0 or idx >= len(subs):
+        print(f"无效订阅编号: {index_text}")
+        return False
+    removed = subs.pop(idx)
+    save_subscriptions(subs)
+    print(f"已删除订阅: {removed.get('name') or removed.get('url')}")
+    if subs:
+        return import_from_subscriptions(verbose=True)
+    save_config(base_config())
+    print("订阅已清空，节点列表已清空")
+    return True
+
+
+def set_proxy_mode(mode):
+    apply_mode(mode)
+    print(f"已切换模式: {MODE_LABELS.get(mode, mode)}")
+    if mode == "inbound":
+        print(f"  仅监听本地入站: socks5://127.0.0.1:{SOCKS_PORT}  http://127.0.0.1:{HTTP_PORT}")
+        print("  不写入 shell / 系统环境变量")
+    elif mode == "outbound":
+        print("  写入 shell 环境变量: /etc/profile.d/xray-proxy.sh")
+        print("  当前 shell 需执行: source /etc/profile.d/xray-proxy.sh")
+    elif mode == "global":
+        print("  写入 shell 环境变量 + /etc/environment")
+        print("  新登录 shell / 会话会自动带代理环境变量")
+
+
+def list_nodes():
+    runtime = detect_runtime()
+    nodes = get_nodes()
+    current = get_current_tag()
+    service_active = check_service()
+    subs = load_subscriptions()
+    enabled_subs = sum(1 for s in subs if s.get("enabled", True))
+    mode = get_mode()
+
+    print(f"\n{'='*56}")
+    print(f"  SOCKS5: 127.0.0.1:{SOCKS_PORT}  |  HTTP: 127.0.0.1:{HTTP_PORT}")
+    print(f"{'='*56}")
+    print("  000. 更新所有订阅链接")
+    print("  00.  添加订阅链接")
+    print("  001. 查看订阅列表")
+    print("  002. 删除订阅")
+    print("  01.  仅入站代理")
+    print("  02.  仅出站代理")
+    print("  03.  全局代理")
+    print("  04.  安装官方 Xray")
+    print("  05.  导出 v2rayN 订阅")
+    print("  06.  检查入站监听/代理握手")
+    print("  0.   测试代理节点出口 IP")
+    print("  check. 检查系统直连/环境变量")
+
+    for i, n in enumerate(nodes, 1):
+        tag = n.get("tag", "?")
+        vnext = n.get("settings", {}).get("vnext", [{}])[0]
+        addr = vnext.get("address", "?")
+        port = vnext.get("port", "?")
+        marker = " ★ 当前" if tag == current else ""
+        print(f"  {i}. [{tag}]  {addr}:{port}{marker}")
+
+    print(f"{'='*56}")
+    status = "● RUNNING" if service_active else "○ STOPPED"
+    print(f"  状态: {status}  |  模式: {MODE_LABELS.get(mode, mode)}  |  当前节点: {current}")
+    print(f"  服务: {runtime['service']}  |  配置: {runtime['config_file']}")
+    print(f"  订阅: {enabled_subs}/{len(subs)} 已启用  |  节点数: {len(nodes)}")
+    print(f"{'='*56}\n")
+
+
+def require_service():
+    runtime = detect_runtime()
+    if run(["systemctl", "cat", runtime["service"]], timeout=8).returncode != 0:
+        print(f"未检测到可用服务: {runtime['service']}")
+        print("可先执行: proxy 04")
+        return None
+    return runtime
+
+
+
+def switch_node(tag):
+    runtime = require_service()
+    if runtime is None:
+        return
+    cfg = load_config()
+    valid_tags = [n.get("tag") for n in cfg.get("outbounds", [])]
+    if tag not in valid_tags:
+        print(f"未知节点: {tag}")
+        print(f"可用节点: {', '.join(valid_tags)}")
+        sys.exit(1)
+    cfg["routing"] = {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [{"type": "field", "outboundTag": tag, "port": "0-65535"}],
+    }
+    save_config(cfg)
+    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+    time.sleep(0.5)
+    print(f"已切换到 [{tag}]")
+    print("  仅入站模式不会自动检测代理出口 IP；如需测试节点出口，请手动执行: proxy 0")
+
+
+def start_proxy():
+    runtime = require_service()
+    if runtime is None:
+        return
+    apply_mode(get_mode())
+    subprocess.run(["systemctl", "enable", runtime["service"], "--now"], capture_output=True, timeout=15)
+    print("代理已启动")
+    print(f"  当前模式: {MODE_LABELS.get(get_mode(), get_mode())}")
+    print(f"  服务: {runtime['service']}  |  配置: {runtime['config_file']}")
+    print(f"  本地监听: socks5://127.0.0.1:{SOCKS_PORT}  http://127.0.0.1:{HTTP_PORT}")
+
+
+def stop_proxy():
+    runtime = detect_runtime()
+    subprocess.run(["systemctl", "stop", runtime["service"]], capture_output=True, timeout=15)
+    subprocess.run(["systemctl", "disable", runtime["service"]], capture_output=True, timeout=15)
+    cleanup_env_file()
+    clear_global_env_file()
+    print("代理已停止")
+    print("  已关闭本地监听，并清理 shell / 系统代理环境变量")
+
+
+
+
+def print_ip_result(data, source=None, prefix="  "):
+    ip = data.get("query") or data.get("ip") or data.get("origin") or "?"
+    print(f"{prefix}IP:    {ip}")
+    if data.get("country") or data.get("countryCode"):
+        print(f"{prefix}国家:  {data.get('country', '?')} ({data.get('countryCode', '?')})")
+    if data.get("city"):
+        print(f"{prefix}城市:  {data.get('city', '?')}")
+    if data.get("isp") or data.get("org"):
+        print(f"{prefix}ISP:   {data.get('isp') or data.get('org')}")
+    if source:
+        print(f"{prefix}检测源: {source}")
+
+
+def print_direct_ip(prefix="  直连"):
+    endpoints = [
+        "https://ipinfo.io/json",
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.co/json",
+        "https://cloudflare.com/cdn-cgi/trace",
+        "http://ip-api.com/json/?lang=zh-CN",
+    ]
+    clean_env = {k: v for k, v in os.environ.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}}
+    for url in endpoints:
+        try:
+            result = subprocess.run(
+                ["curl", "--noproxy", "*", "-sS", "--max-time", "8", url],
+                capture_output=True, text=True, timeout=11, env=clean_env,
+            )
+            body = result.stdout.strip()
+            if result.returncode == 0 and body:
+                data = json.loads(body)
+                print(f"{prefix}出口 IP：")
+                print_ip_result(data, url, prefix="    ")
+                return True
+        except Exception:
+            pass
+    print(f"{prefix}出口 IP 检测失败")
+    return False
+
+def check_node_tcp(tag, timeout=2):
+    cfg = load_config()
+    for node in cfg.get("outbounds", []):
+        if node.get("tag") != tag:
+            continue
+        vnext = node.get("settings", {}).get("vnext", [{}])[0]
+        host = vnext.get("address", "")
+        port = int(vnext.get("port", 0) or 0)
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True, f"{host}:{port}", ""
+        except Exception as e:
+            return False, f"{host}:{port}", f"{type(e).__name__}: {e}"
+    return False, "", "节点不存在"
+
+
+def curl_via_proxy(url, timeout=6):
+    return subprocess.run(
+        [
+            "curl", "-x", f"socks5h://127.0.0.1:{SOCKS_PORT}",
+            "-sS", "--max-time", str(timeout), url,
+        ],
+        capture_output=True, text=True, timeout=timeout + 3,
+    )
+
+
+def test_proxy_ip(tag=None):
+    if not check_service():
+        print("代理未运行，请先执行 proxy on")
+        return False
+    current = tag or get_current_tag()
+    print(f"测试代理节点 [{current}] 出口 IP（显式通过 socks5://127.0.0.1:{SOCKS_PORT}）...")
+
+    ok, target, err = check_node_tcp(current)
+    if not ok:
+        print(f"  节点 TCP 不通: {target}  {err}")
+        print("  继续尝试通过本地代理检测；失败后显示直连出口 IP 作为兜底 ...")
+
+    endpoints = [
+        "https://ipinfo.io/json",
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.co/json",
+        "https://cloudflare.com/cdn-cgi/trace",
+        "http://ip-api.com/json/?lang=zh-CN",
+    ]
+    last_error = ""
+    for url in endpoints:
+        try:
+            result = curl_via_proxy(url)
+            body = result.stdout.strip()
+            if result.returncode == 0 and body:
+                data = json.loads(body)
+                print_ip_result(data, url, prefix="  ")
+                return True
+            last_error = (result.stderr.strip() or body or f"curl exit {result.returncode}")
+        except Exception as e:
+            last_error = str(e)
+    print(f"  代理出口检测失败: {last_error}")
+    print_direct_ip(prefix="  兜底直连")
+    return False
+
+def test_current_ip():
+    test_proxy_ip(get_current_tag())
+
+def test_node(tag):
+    runtime = require_service()
+    if runtime is None:
+        return
+    cfg = load_config()
+    valid_tags = [n.get("tag") for n in cfg.get("outbounds", [])]
+    if tag not in valid_tags:
+        print(f"未知节点: {tag}")
+        print(f"可用节点: {', '.join(valid_tags)}")
+        sys.exit(1)
+
+    old_routing = cfg.get("routing", {})
+    cfg["routing"] = {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [{"type": "field", "outboundTag": tag, "port": "0-65535"}],
+    }
+    save_config(cfg)
+    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+    time.sleep(1)
+    try:
+        test_proxy_ip(tag)
+    finally:
+        cfg["routing"] = old_routing
+        save_config(cfg)
+        subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+        print("  已恢复原节点")
+
+
+
+
+
+def get_public_ip_for_display():
+    urls = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "http://ip-api.com/line/?fields=query",
+    ]
+    clean_env = {k: v for k, v in os.environ.items() if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}}
+    for url in urls:
+        try:
+            r = subprocess.run(
+                ["curl", "--noproxy", "*", "-fsS", "--max-time", "6", url],
+                capture_output=True, text=True, timeout=9, env=clean_env,
+            )
+            ip = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+            if re.match(r"^[0-9a-fA-F:.]+$", ip):
+                return ip
+        except Exception:
+            pass
+    return "未知"
+
+
+def inbound_listen_addresses():
+    cfg = load_config()
+    items = []
+    for inbound in cfg.get("inbounds", []):
+        proto = str(inbound.get("protocol", "?")).upper()
+        listen = inbound.get("listen", "0.0.0.0") or "0.0.0.0"
+        port = inbound.get("port", "?")
+        items.append((proto, listen, port))
+    return items
+
+
+def fetch_ip_json(cmd_prefix, timeout=10):
+    endpoints = [
+        "https://ipinfo.io/json",
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.co/json",
+        "https://cloudflare.com/cdn-cgi/trace",
+        "http://ip-api.com/json/?lang=zh-CN",
+    ]
+    last_error = ""
+    for url in endpoints:
+        try:
+            r = subprocess.run(
+                cmd_prefix + ["-sS", "--connect-timeout", "3", "--max-time", str(timeout), url],
+                capture_output=True, text=True, timeout=timeout + 3,
+            )
+            body = r.stdout.strip()
+            if r.returncode == 0 and body:
+                try:
+                    return json.loads(body), url, ""
+                except Exception:
+                    if re.match(r"^[0-9a-fA-F:.]+$", body):
+                        return {"ip": body}, url, ""
+                    m = re.search(r"(?m)^ip=([^\n]+)", body)
+                    if m:
+                        return {"ip": m.group(1).strip()}, url, ""
+                    last_error = body[:200]
+            else:
+                last_error = r.stderr.strip() or body or f"curl exit {r.returncode}"
+        except Exception as e:
+            last_error = str(e)
+    return None, "", last_error
+
+
+def print_compact_ip(label, data, source=None):
+    ip = data.get("query") or data.get("ip") or data.get("origin") or "?"
+    country = data.get("country") or data.get("country_name") or "?"
+    cc = data.get("countryCode") or data.get("country_code") or "?"
+    city = data.get("city") or "?"
+    isp = data.get("isp") or data.get("org") or "?"
+    print(f"  {label}: {ip}  {country}({cc})  {city}  {isp}", flush=True)
+    if source:
+        print(f"    检测源: {source}", flush=True)
+
+def check_inbound_proxy():
+    print("检查入站代理是否生效 ...", flush=True)
+    runtime = detect_runtime()
+    service_active = check_service()
+    public_ip = get_public_ip_for_display()
+    listens = inbound_listen_addresses()
+    current = get_current_tag()
+
+    print(f"  当前节点: {current}", flush=True)
+    print(f"  本机公网 IP: {public_ip}", flush=True)
+    for proto, listen, port in listens:
+        scope = "仅本机" if listen in {"127.0.0.1", "::1", "localhost"} else "可被外部访问(取决于防火墙/安全组)"
+        public_addr = f"{public_ip}:{port}" if public_ip != "未知" else f"<公网IP>:{port}"
+        print(f"  {proto} 入站监听: {listen}:{port}  |  范围: {scope}", flush=True)
+        if listen in {"127.0.0.1", "::1", "localhost"}:
+            print(f"    公网入口展示: {public_addr}（当前未公网监听，外部不能直接连）", flush=True)
+        else:
+            print(f"    公网入口地址: {public_addr}", flush=True)
+
+    print(f"  服务: {runtime['service']}  {'● RUNNING' if service_active else '○ STOPPED'}", flush=True)
+    if not service_active:
+        print("  结论: 服务未运行，请先执行: proxy on", flush=True)
+        return False
+
+    ok = True
+    r = subprocess.run(["ss", "-lntp"], capture_output=True, text=True, timeout=5)
+    ss_out = r.stdout
+    for port, name in [(SOCKS_PORT, "SOCKS5"), (HTTP_PORT, "HTTP")]:
+        listening = f"127.0.0.1:{port}" in ss_out or f"0.0.0.0:{port}" in ss_out or f"[::1]:{port}" in ss_out or f":{port}" in ss_out
+        print(f"  {name} 端口监听 {port}: {'OK' if listening else 'FAIL'}", flush=True)
+        if not listening:
+            ok = False
+
+    try:
+        with socket.create_connection(("127.0.0.1", SOCKS_PORT), timeout=3) as sock:
+            sock.settimeout(3)
+            sock.sendall(b"\x05\x01\x00")
+            resp = sock.recv(2)
+        if resp == b"\x05\x00":
+            print("  SOCKS5 入站握手: OK", flush=True)
+        else:
+            ok = False
+            print(f"  SOCKS5 入站握手: FAIL ({resp!r})", flush=True)
+    except Exception as e:
+        ok = False
+        print(f"  SOCKS5 入站握手: FAIL ({e})", flush=True)
+
+    try:
+        with socket.create_connection(("127.0.0.1", HTTP_PORT), timeout=3):
+            pass
+        print("  HTTP 入站 TCP 连接: OK", flush=True)
+    except Exception as e:
+        ok = False
+        print(f"  HTTP 入站 TCP 连接: FAIL ({e})", flush=True)
+
+    print("  端到端出口验证:", flush=True)
+    direct_data, direct_src, direct_err = fetch_ip_json(["curl", "--noproxy", "*"], timeout=8)
+    if direct_data:
+        print_compact_ip("直连出口", direct_data, direct_src)
+    else:
+        print(f"  直连出口: FAIL ({direct_err})", flush=True)
+
+    socks_data, socks_src, socks_err = fetch_ip_json(["curl", "-x", f"socks5h://127.0.0.1:{SOCKS_PORT}"], timeout=10)
+    if socks_data:
+        print_compact_ip("SOCKS5 入站代理出口", socks_data, socks_src)
+    else:
+        ok = False
+        print(f"  SOCKS5 入站代理出口: FAIL ({socks_err})", flush=True)
+
+    http_data, http_src, http_err = fetch_ip_json(["curl", "-x", f"http://127.0.0.1:{HTTP_PORT}"], timeout=10)
+    if http_data:
+        print_compact_ip("HTTP 入站代理出口", http_data, http_src)
+    else:
+        ok = False
+        print(f"  HTTP 入站代理出口: FAIL ({http_err})", flush=True)
+
+    if socks_data and direct_data:
+        dip = direct_data.get("query") or direct_data.get("ip") or direct_data.get("origin")
+        pip = socks_data.get("query") or socks_data.get("ip") or socks_data.get("origin")
+        if dip and pip and dip != pip:
+            print(f"  证明: 入站代理已生效，流量从代理 IP {pip} 进口，不是本机直连 {dip}", flush=True)
+        elif dip and pip:
+            print(f"  说明: 入站代理可用，但代理出口 IP 与本机直连相同: {pip}", flush=True)
+
+    print(f"  结论: {'入站代理正常' if ok else '入站代理异常'}", flush=True)
+    return ok
+
+def check_system_proxy():
+    print("检查系统出站代理状态 ...")
+    profile_exists = os.path.exists(PROXY_SH)
+    env_lines = []
+    if os.path.exists(ENV_FILE):
+        env_lines = [line for line in Path(ENV_FILE).read_text().splitlines() if re.match(r"(?i)^(http|https|all)_proxy=", line.strip())]
+    proc_env = {k: v for k, v in os.environ.items() if k.lower() in {"http_proxy", "https_proxy", "all_proxy"}}
+
+    print(f"  模式文件: {MODE_LABELS.get(get_mode(), get_mode())}")
+    print(f"  /etc/profile.d/xray-proxy.sh: {'存在' if profile_exists else '不存在'}")
+    print(f"  /etc/environment 代理变量: {len(env_lines)} 条")
+    print(f"  当前进程代理环境变量: {len(proc_env)} 条")
+
+    if profile_exists or env_lines or proc_env:
+        print("  结论: 检测到系统/ shell 出站代理痕迹")
+        if profile_exists:
+            print(f"    - {PROXY_SH}")
+        for line in env_lines:
+            print(f"    - /etc/environment: {line}")
+        for k, v in sorted(proc_env.items()):
+            print(f"    - env: {k}={v}")
+    else:
+        print("  结论: 未检测到系统/ shell 出站代理环境变量")
+
+    print_direct_ip(prefix="  直连")
+
+def install_official_xray():
+    url = "https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+    tmp = BASE_DIR / f".install_xray_{int(time.time())}.sh"
+    print("开始下载官方 Xray 安装脚本...")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            tmp.write_bytes(resp.read())
+        tmp.chmod(0o700)
+        print(f"已生成临时脚本: {tmp}")
+        res = subprocess.run(["bash", str(tmp), "install"], text=True)
+        if res.returncode != 0:
+            print("官方安装脚本执行失败")
+            sys.exit(res.returncode)
+        print("官方 Xray 安装完成")
+        runtime = detect_runtime()
+        print(f"  服务: {runtime['service']}")
+        print(f"  配置: {runtime['config_file']}")
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+            print("临时安装脚本已删除")
+
+
+def main():
+    ensure_subscriptions_file()
+    ensure_mode_file()
+
+    if len(sys.argv) == 1:
+        list_nodes()
+        return
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        cmd = args[i].lower()
+
+        if cmd == "000":
+            ok = import_from_subscriptions(verbose=True)
+            if ok:
+                runtime = require_service()
+                if runtime:
+                    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+            i += 1
+        elif cmd == "001":
+            list_subscriptions()
+            i += 1
+        elif cmd == "002":
+            if i + 1 >= len(args):
+                print("用法: proxy 002 <订阅编号>")
+                sys.exit(1)
+            ok = remove_subscription(args[i + 1])
+            if ok:
+                runtime = require_service()
+                if runtime:
+                    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+            i += 2
+        elif cmd == "00":
+            if i + 1 >= len(args):
+                print("用法: proxy 00 <订阅链接> [名称]")
+                sys.exit(1)
+            url = args[i + 1]
+            name = None
+            consumed = 2
+            if i + 2 < len(args):
+                nxt = args[i + 2].lower()
+                if nxt not in ACTION_TOKENS and resolve_tag(args[i + 2]) is None:
+                    name = args[i + 2]
+                    consumed = 3
+            ok = add_subscription(url, name)
+            if ok:
+                runtime = require_service()
+                if runtime:
+                    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+            i += consumed
+        elif cmd == "01":
+            set_proxy_mode("inbound")
+            i += 1
+        elif cmd == "02":
+            set_proxy_mode("outbound")
+            i += 1
+        elif cmd == "03":
+            set_proxy_mode("global")
+            i += 1
+        elif cmd == "04":
+            install_official_xray()
+            i += 1
+        elif cmd == "05":
+            export_v2rayn_subscription()
+            i += 1
+        elif cmd == "0":
+            test_current_ip()
+            i += 1
+        elif cmd == "06":
+            check_inbound_proxy()
+            i += 1
+        elif cmd == "check":
+            check_system_proxy()
+            i += 1
+        elif cmd in ("off", "stop"):
+            stop_proxy()
+            i += 1
+        elif cmd in ("on", "start"):
+            start_proxy()
+            i += 1
+        elif cmd == "test":
+            if i + 1 >= len(args):
+                print("用法: proxy test <序号|tag>")
+                sys.exit(1)
+            tag = resolve_tag(args[i + 1])
+            if tag is None:
+                print(f"无效参数: {args[i + 1]}")
+                sys.exit(1)
+            test_node(tag)
+            i += 2
+        else:
+            tag = resolve_tag(cmd)
+            if tag is None:
+                nodes = get_nodes()
+                valid_tags = [n["tag"] for n in nodes]
+                print(f"未知: {cmd}")
+                print(f"可用: 000 / 00 / 001 / 002 / 01 / 02 / 03 / 04 / 05 / 0 / 序号 1-{len(nodes)} / {', '.join(valid_tags)}")
+                sys.exit(1)
+            switch_node(tag)
+            i += 1
+
+
+if __name__ == "__main__":
+    main()

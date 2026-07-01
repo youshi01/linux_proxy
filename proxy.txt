@@ -1,0 +1,138 @@
+# 通用版 Proxy 脚本使用说明
+
+路径: `/root/proxy`
+
+## 目标
+
+这是一份尽量通用的代理管理脚本，适合在别的机器上快速落地：
+
+- 自动识别常见官方 `xray` / `v2ray` 安装
+- 自动识别常见 `systemd` 服务名
+- 自动识别常见配置路径
+- 支持订阅管理、节点切换、三种代理模式
+- 支持一键执行官方 Xray 安装脚本
+- 支持导出给 v2rayN 使用的订阅文件
+
+## 自动识别范围
+
+优先识别这些服务名：
+- `xray-proxy`
+- `xray`
+- `v2ray`
+- `v2ray-proxy`
+
+优先识别这些配置文件：
+- `/root/xray_proxy_config.json`（脚本同目录）
+- `/usr/local/etc/xray/config.json`
+- `/etc/xray/config.json`
+- `/usr/local/etc/v2ray/config.json`
+- `/etc/v2ray/config.json`
+
+## 三种模式
+
+### `01` - 仅入站代理
+- 只保留本地监听：
+  - `socks5://127.0.0.1:10808`
+  - `http://127.0.0.1:10809`
+- 不写 shell 环境变量
+- 不写系统全局环境变量
+- 会清理 `/etc/profile.d/xray-proxy.sh` 和 `/etc/environment` 里的代理变量
+- 注意：`proxy 0` 是“显式通过本地 SOCKS 测试代理节点出口”，不是系统出站代理检测；要检查系统是否走代理请用 `proxy check`
+
+### `02` - 仅出站代理
+- 保留本地监听
+- 写 `/etc/profile.d/xray-proxy.sh`
+- 不写 `/etc/environment`
+
+### `03` - 全局代理
+- 保留本地监听
+- 写 `/etc/profile.d/xray-proxy.sh`
+- 写 `/etc/environment`
+
+## 安装/导出选项
+
+### `04` - 安装官方 Xray
+执行逻辑：
+1. 下载官方安装脚本：
+   `https://github.com/XTLS/Xray-install/raw/main/install-release.sh`
+2. 在当前机器执行安装
+3. 安装完成后自动删除临时脚本
+
+### `05` - 导出 v2rayN 订阅
+会在脚本同目录生成两个文件：
+- `v2rayn_subscription_raw.txt`：原始 `vless://` 链接列表
+- `v2rayn_subscription.txt`：Base64 编码后的订阅文本
+
+适合把当前节点导给 v2rayN 客户端直接使用。
+
+## 命令一览
+
+```bash
+proxy                         # 显示状态、模式、节点、服务、配置路径
+proxy 000                     # 更新所有订阅并刷新节点
+proxy 00 <订阅链接>           # 添加订阅并立即更新
+proxy 00 <订阅链接> <名称>    # 添加订阅并指定名称
+proxy 001                     # 查看订阅列表
+proxy 002 <订阅编号>          # 删除订阅
+proxy 01                      # 切到 仅入站代理
+proxy 02                      # 切到 仅出站代理
+proxy 03                      # 切到 全局代理
+proxy 04                      # 安装官方 Xray
+proxy 05                      # 导出 v2rayN 订阅文件
+proxy 06                      # 检查入站监听 / SOCKS5 握手 / HTTP 入站 TCP 连接
+proxy 0                       # 测试代理节点出口 IP（显式通过本地 SOCKS）
+proxy check                   # 检查系统直连出口 / shell 环境变量
+proxy <序号>                  # 切换节点，如 proxy 2；仅切换，不自动检测出口 IP
+proxy <tag>                   # 切换节点，如 proxy CL-JP；仅切换，不自动检测出口 IP
+proxy on                      # 按当前模式启动服务
+proxy off                     # 停止服务并清理环境变量
+proxy test <序号|tag>         # 临时切换测试后恢复；节点 TCP 不通时仍会尝试代理出口检测，失败后显示直连出口 IP 兜底
+```
+
+## 支持组合执行
+
+可以一次写多个动作，按顺序执行：
+
+```bash
+proxy 01 5
+proxy 02 on
+proxy 03 000
+proxy 04 000 01
+proxy 05
+```
+
+例如：
+- `proxy 01 5`：先切到仅入站，再切 5 号节点；不会自动检测出口 IP
+- `proxy 02 on`：先切到仅出站，再启动服务
+- `proxy 03 000`：先切到全局，再更新订阅
+- `proxy 04 000 01`：先安装官方 Xray，再更新订阅，再切回仅入站模式
+- `proxy 05`：把当前节点集合导出成 v2rayN 可用订阅文件
+
+## 订阅文件与模式文件
+
+默认都放在脚本同目录：
+- `proxy_subscriptions.json`
+- `proxy_mode.json`
+
+这样把 `/root/proxy` 丢到别的机器上时，相关文件也跟着放 `/root/` 就行。
+
+## 节点来源
+
+- 当前自动导入 `vless://` 订阅
+- `proxy 000` 会根据订阅重建目标配置文件
+- 如果当前节点还存在，就保留当前节点；否则切第一个
+
+## 注意
+
+1. 这份脚本会**重写识别到的主配置文件**，更适合纯代理机
+2. 如果目标机原本有复杂业务配置，先自行备份
+3. 首次在新机器上执行前，建议先运行：
+
+```bash
+proxy
+```
+
+先看它识别到了哪个服务、哪个配置文件
+
+4. `04` 会执行官方安装脚本，要求机器能正常访问 GitHub 或镜像
+5. `05` 导出的 Base64 文件可以直接作为 v2rayN 的本地订阅内容或中转订阅源
