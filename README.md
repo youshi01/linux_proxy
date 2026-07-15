@@ -29,6 +29,9 @@
 - 支持一键拉取并执行官方 Xray 安装脚本。
 - 支持导出 v2rayN 可用订阅文件。
 - 支持多个命令组合执行。
+- 配置、订阅和模式文件使用原子写入，降低意外中断导致文件损坏的风险。
+- systemd 操作失败时返回非零状态，不再静默显示成功。
+- 支持原始文本、标准 Base64 和 URL-safe Base64 订阅内容。
 
 ## 默认端口
 
@@ -37,6 +40,35 @@
 ```txt
 SOCKS5: 127.0.0.1:10808
 HTTP:   127.0.0.1:10809
+```
+
+项目不内置任何订阅地址、节点、UUID、生产服务器 IP 或固定代理出口。所有节点数据只来自使用者自己添加的订阅。
+
+运行要求：Python 3.9+、systemd，以及已安装的 Xray 或 V2Ray。`proxy 04` 可以安装官方 Xray。
+
+## 通用 Linux 配置
+
+默认配置适用于常见的 systemd + Xray/V2Ray 安装。非标准服务名、配置路径、端口或数据目录可以通过环境变量覆盖：
+
+| 环境变量 | 默认值 | 用途 |
+|---|---|---|
+| `LINUX_PROXY_SERVICE` | 自动识别 | 优先使用的 systemd 服务名 |
+| `LINUX_PROXY_CONFIG` | 自动识别 | 优先使用的 Xray/V2Ray 配置文件 |
+| `LINUX_PROXY_SOCKS_PORT` | `10808` | 本地 SOCKS5 端口 |
+| `LINUX_PROXY_HTTP_PORT` | `10809` | 本地 HTTP 代理端口 |
+| `LINUX_PROXY_DATA_DIR` | 脚本所在目录 | 订阅、模式和导出文件目录 |
+| `LINUX_PROXY_PROFILE_FILE` | `/etc/profile.d/xray-proxy.sh` | shell 代理环境文件 |
+| `LINUX_PROXY_ENV_FILE` | `/etc/environment` | 系统环境文件 |
+
+例如使用自定义服务和配置：
+
+```bash
+sudo env \
+  LINUX_PROXY_SERVICE=my-proxy \
+  LINUX_PROXY_CONFIG=/etc/my-proxy/config.json \
+  LINUX_PROXY_SOCKS_PORT=12080 \
+  LINUX_PROXY_HTTP_PORT=12081 \
+  proxy 02
 ```
 
 ## 快速安装
@@ -68,13 +100,15 @@ proxy 04
 proxy 00 <订阅链接>
 ```
 
-启动代理：
+选择代理模式并启动代理（`01` / `02` / `03` 都会自动启动服务）：
 
 ```bash
-proxy on
+proxy 01
 ```
 
 ## 三种代理模式
+
+执行 `proxy 01`、`proxy 02` 或 `proxy 03` 时，脚本会先执行 `systemctl enable <服务> --now`，并确认服务为 `active`、本地 SOCKS5 握手正常、HTTP 端口可连接。只有检查通过后才会写入模式和代理环境变量；失败时命令返回非零状态并清理代理环境变量。
 
 ### `proxy 01` 仅入站代理
 
@@ -130,9 +164,9 @@ proxy 00 <订阅链接> <名称>    # 添加订阅并指定名称
 proxy 001                     # 查看订阅列表
 proxy 002 <订阅编号>          # 删除订阅
 
-proxy 01                      # 切到仅入站代理
-proxy 02                      # 切到仅出站代理
-proxy 03                      # 切到全局代理
+proxy 01                      # 切到仅入站代理，自动启动并检查服务
+proxy 02                      # 切到仅出站代理，自动启动并检查服务
+proxy 03                      # 切到全局代理，自动启动并检查服务
 
 proxy 04                      # 安装官方 Xray
 proxy 05                      # 导出 v2rayN 订阅文件
@@ -145,7 +179,7 @@ proxy <序号>                  # 切换节点，例如 proxy 2
 proxy <tag>                   # 切换节点，例如 proxy CL-JP
 proxy test <序号|tag>         # 临时切换测试，测试后恢复原节点
 
-proxy on                      # 按当前模式启动服务
+proxy on                      # 重新按当前模式启动并检查服务
 proxy off                     # 停止服务并清理代理环境变量
 ```
 
@@ -155,7 +189,7 @@ proxy off                     # 停止服务并清理代理环境变量
 
 ```bash
 proxy 01 5
-proxy 02 on
+proxy 02
 proxy 03 000
 proxy 04 000 01
 proxy 05
@@ -163,8 +197,8 @@ proxy 05
 
 示例说明：
 
-- `proxy 01 5`：先切到仅入站模式，再切换到第 5 个节点。
-- `proxy 02 on`：先切到仅出站模式，再启动服务。
+- `proxy 01 5`：先启动服务并切到仅入站模式，再切换到第 5 个节点。
+- `proxy 02`：启动服务并切到仅出站模式。
 - `proxy 03 000`：先切到全局模式，再更新所有订阅。
 - `proxy 04 000 01`：先安装官方 Xray，再更新订阅，最后切回仅入站模式。
 - `proxy 05`：把当前节点集合导出成 v2rayN 可用订阅文件。
@@ -198,7 +232,7 @@ v2ray-proxy
 
 ## 运行时文件
 
-脚本会把订阅和模式文件放在脚本同目录：
+脚本默认把订阅和模式文件放在脚本同目录；也可以通过 `LINUX_PROXY_DATA_DIR` 修改：
 
 ```txt
 proxy_subscriptions.json
@@ -245,7 +279,19 @@ proxy on
 3. `proxy 04` 会下载并执行官方 Xray 安装脚本，需要 root 权限和 GitHub 访问能力。
 4. 当前主要面向 `vless://` 订阅导入。
 5. 不要把真实订阅链接提交到公开仓库。
+6. 订阅和生成的配置默认以仅所有者可读写的权限保存，但仍应把服务器账号和备份目录视为敏感环境。
+
+## 测试
+
+本地运行：
+
+```bash
+python3 -m py_compile proxy tests/test_proxy_modes.py
+python3 -m unittest discover -s tests -v
+```
+
+GitHub Actions 会在 Python 3.9 至 3.13 上运行相同测试。测试使用随机本地端口和示例域名，不依赖真实订阅或生产代理。
 
 ## 许可证
 
-未指定许可证前，仅建议个人自用或按仓库所有者授权使用。
+本项目使用 [MIT License](LICENSE)。

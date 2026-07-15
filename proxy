@@ -9,26 +9,78 @@
 """
 
 import base64
+import binascii
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, unquote, urlparse
 
+
+def env_port(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        port = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} 必须是端口数字: {raw}") from e
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} 必须在 1-65535 之间: {port}")
+    return port
+
+
+def with_env_override(name, defaults):
+    value = os.environ.get(name, "").strip()
+    return [value, *defaults] if value else list(defaults)
+
+
+def atomic_write_text(path, content, mode=None):
+    path = Path(path)
+    if path.is_symlink():
+        path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_mode = mode
+    if path.exists():
+        file_mode = path.stat().st_mode & 0o777
+
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        if file_mode is not None:
+            os.chmod(temporary_path, file_mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def atomic_write_json(path, data, mode=0o600):
+    content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_text(path, content, mode=mode)
+
+
 BASE_DIR = Path(__file__).resolve().parent
-SUBS_FILE = str(BASE_DIR / "proxy_subscriptions.json")
-MODE_FILE = str(BASE_DIR / "proxy_mode.json")
-PROXY_SH = "/etc/profile.d/xray-proxy.sh"
-ENV_FILE = "/etc/environment"
-SOCKS_PORT = 10808
-HTTP_PORT = 10809
+DATA_DIR = Path(os.environ.get("LINUX_PROXY_DATA_DIR", str(BASE_DIR))).expanduser()
+SUBS_FILE = str(DATA_DIR / "proxy_subscriptions.json")
+MODE_FILE = str(DATA_DIR / "proxy_mode.json")
+PROXY_SH = os.environ.get("LINUX_PROXY_PROFILE_FILE", "/etc/profile.d/xray-proxy.sh")
+ENV_FILE = os.environ.get("LINUX_PROXY_ENV_FILE", "/etc/environment")
+SOCKS_PORT = env_port("LINUX_PROXY_SOCKS_PORT", 10808)
+HTTP_PORT = env_port("LINUX_PROXY_HTTP_PORT", 10809)
 DEFAULT_MODE = "inbound"
 
 DEFAULT_SUBSCRIPTIONS = []
@@ -48,14 +100,17 @@ PROXY_ENV_LINES = [
     f"all_proxy=socks5h://127.0.0.1:{SOCKS_PORT}",
 ]
 
-SERVICE_CANDIDATES = ["xray-proxy", "xray", "v2ray", "v2ray-proxy"]
-CONFIG_CANDIDATES = [
+SERVICE_CANDIDATES = with_env_override(
+    "LINUX_PROXY_SERVICE",
+    ["xray-proxy", "xray", "v2ray", "v2ray-proxy"],
+)
+CONFIG_CANDIDATES = with_env_override("LINUX_PROXY_CONFIG", [
     str(BASE_DIR / "xray_proxy_config.json"),
     "/usr/local/etc/xray/config.json",
     "/etc/xray/config.json",
     "/usr/local/etc/v2ray/config.json",
     "/etc/v2ray/config.json",
-]
+])
 
 ACTION_TOKENS = {
     "000", "00", "001", "002", "01", "02", "03", "04", "05",
@@ -94,8 +149,9 @@ def base_config():
 
 def ensure_subscriptions_file():
     path = Path(SUBS_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        path.write_text(json.dumps(DEFAULT_SUBSCRIPTIONS, indent=2, ensure_ascii=False) + "\n")
+        atomic_write_json(path, DEFAULT_SUBSCRIPTIONS)
 
 
 def load_subscriptions():
@@ -110,13 +166,14 @@ def load_subscriptions():
 
 
 def save_subscriptions(items):
-    Path(SUBS_FILE).write_text(json.dumps(items, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_json(SUBS_FILE, items)
 
 
 def ensure_mode_file():
     path = Path(MODE_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        path.write_text(json.dumps({"mode": DEFAULT_MODE}, ensure_ascii=False) + "\n")
+        atomic_write_json(path, {"mode": DEFAULT_MODE})
 
 
 def get_mode():
@@ -132,25 +189,43 @@ def get_mode():
 
 
 def save_mode(mode):
-    Path(MODE_FILE).write_text(json.dumps({"mode": mode}, ensure_ascii=False) + "\n")
+    atomic_write_json(MODE_FILE, {"mode": mode})
 
 
 def parse_config_path_from_unit(text):
-    patterns = [
-        r"-config\s+(\S+)",
-        r"\s-c\s+(\S+)",
-        r"\sconfig\s+(\S+\.json)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return m.group(1)
+    for line in text.splitlines():
+        if "ExecStart=" not in line:
+            continue
+        command = line.split("ExecStart=", 1)[1].strip()
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            args = command.split()
+
+        for i, arg in enumerate(args):
+            if arg in {"-config", "--config", "-c"} and i + 1 < len(args):
+                return args[i + 1]
+            if arg.startswith(("-config=", "--config=")):
+                return arg.split("=", 1)[1]
+            if arg in {"-confdir", "--confdir"} and i + 1 < len(args):
+                return str(PurePosixPath(args[i + 1]) / "config.json")
+            if arg.startswith(("-confdir=", "--confdir=")):
+                return str(PurePosixPath(arg.split("=", 1)[1]) / "config.json")
+
+    patterns = [r"-config\s+['\"]?([^'\"\s]+)", r"\s-c\s+['\"]?([^'\"\s]+)"]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
     return None
 
 
 def detect_runtime():
     for service in SERVICE_CANDIDATES:
-        r = run(["systemctl", "cat", service], timeout=8)
+        try:
+            r = run(["systemctl", "cat", service], timeout=8)
+        except (OSError, subprocess.SubprocessError):
+            continue
         if r.returncode == 0:
             cfg = parse_config_path_from_unit(r.stdout)
             if cfg:
@@ -181,7 +256,7 @@ def backup_config(path):
     p = Path(path)
     if not p.exists():
         return
-    backup = p.with_name(p.name + f".bak.{int(time.time())}")
+    backup = p.with_name(p.name + f".bak.{time.time_ns()}")
     shutil.copy2(p, backup)
 
 
@@ -191,8 +266,7 @@ def save_config(cfg):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         backup_config(path)
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    atomic_write_json(path, cfg)
 
 
 def get_nodes():
@@ -218,13 +292,104 @@ def resolve_tag(arg):
     return None
 
 
-def check_service():
-    runtime = detect_runtime()
+def service_is_active(service):
     try:
-        r = run(["systemctl", "is-active", runtime["service"]], timeout=5)
+        r = run(["systemctl", "is-active", service], timeout=5)
         return r.stdout.strip() == "active"
     except Exception:
         return False
+
+
+def check_service():
+    runtime = detect_runtime()
+    return service_is_active(runtime["service"])
+
+
+def socks_inbound_ready(timeout=0.5):
+    try:
+        with socket.create_connection(("127.0.0.1", SOCKS_PORT), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x05\x01\x00")
+            return sock.recv(2) == b"\x05\x00"
+    except Exception:
+        return False
+
+
+def http_inbound_ready(timeout=0.5):
+    try:
+        with socket.create_connection(("127.0.0.1", HTTP_PORT), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def wait_for_proxy_ready(service, timeout=8):
+    deadline = time.monotonic() + timeout
+    active = socks_ok = http_ok = False
+    while True:
+        active = service_is_active(service)
+        socks_ok = socks_inbound_ready()
+        http_ok = http_inbound_ready()
+        if active and socks_ok and http_ok:
+            return True, ""
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+
+    missing = []
+    if not active:
+        missing.append("systemd 服务未处于 active")
+    if not socks_ok:
+        missing.append(f"SOCKS5 127.0.0.1:{SOCKS_PORT} 未就绪")
+    if not http_ok:
+        missing.append(f"HTTP 127.0.0.1:{HTTP_PORT} 未就绪")
+    return False, "；".join(missing)
+
+
+def ensure_proxy_running(runtime):
+    service = runtime["service"]
+    try:
+        result = run(["systemctl", "enable", service, "--now"], timeout=15)
+    except Exception as e:
+        print(f"启动代理服务失败: {type(e).__name__}: {e}")
+        return False
+
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or f"退出码 {result.returncode}"
+        print(f"启动代理服务失败: systemctl enable {service} --now")
+        print(f"  {error}")
+        return False
+
+    ready, reason = wait_for_proxy_ready(service)
+    if not ready:
+        print(f"代理服务未就绪: {reason}")
+        print(f"  可检查日志: journalctl -u {service} -n 50 --no-pager")
+        return False
+    return True
+
+
+def command_error(result):
+    return result.stderr.strip() or result.stdout.strip() or f"退出码 {result.returncode}"
+
+
+def restart_proxy_service(runtime, verify=True):
+    service = runtime["service"]
+    try:
+        result = run(["systemctl", "restart", service], timeout=15)
+    except Exception as e:
+        print(f"重启代理服务失败: {type(e).__name__}: {e}")
+        return False
+    if result.returncode != 0:
+        print(f"重启代理服务失败: {service}")
+        print(f"  {command_error(result)}")
+        return False
+    if verify:
+        ready, reason = wait_for_proxy_ready(service)
+        if not ready:
+            print(f"代理服务重启后未就绪: {reason}")
+            print(f"  可检查日志: journalctl -u {service} -n 50 --no-pager")
+            return False
+    return True
 
 
 def cleanup_env_file():
@@ -246,15 +411,14 @@ def remove_env_vars_from_text(text):
 
 def write_profile_env_file():
     content = "\n".join([f"export {line}" for line in PROXY_ENV_LINES]) + "\n"
-    with open(PROXY_SH, "w") as f:
-        f.write(content)
+    atomic_write_text(PROXY_SH, content, mode=0o644)
 
 
 def write_global_env_file():
     existing = Path(ENV_FILE).read_text() if os.path.exists(ENV_FILE) else ""
     cleaned = remove_env_vars_from_text(existing)
     final = (cleaned + "\n" if cleaned else "") + "\n".join(PROXY_ENV_LINES) + "\n"
-    Path(ENV_FILE).write_text(final)
+    atomic_write_text(ENV_FILE, final, mode=0o644)
 
 
 def clear_global_env_file():
@@ -262,7 +426,7 @@ def clear_global_env_file():
         return
     existing = Path(ENV_FILE).read_text()
     cleaned = remove_env_vars_from_text(existing)
-    Path(ENV_FILE).write_text((cleaned + "\n") if cleaned else "")
+    atomic_write_text(ENV_FILE, (cleaned + "\n") if cleaned else "", mode=0o644)
 
 
 def apply_mode(mode):
@@ -289,19 +453,43 @@ def unique_tag(tag, seen):
     return final
 
 
+def looks_like_subscription_text(text):
+    return any(re.match(r"^[a-z][a-z0-9+.-]*://", line.strip(), re.I) for line in text.splitlines())
+
+
+def decode_subscription_text(raw):
+    raw = raw.strip()
+    if not raw or looks_like_subscription_text(raw):
+        return raw
+
+    compact = re.sub(r"\s+", "", raw)
+    padded = compact + "=" * (-len(compact) % 4)
+    for altchars in (None, b"-_"):
+        try:
+            decoded = base64.b64decode(padded, altchars=altchars, validate=True).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            continue
+        if looks_like_subscription_text(decoded):
+            return decoded.strip()
+    return raw
+
+
 def fetch_subscription_text(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         raw = resp.read().decode("utf-8", "ignore").strip()
-    try:
-        return base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
-    except Exception:
-        return raw
+    return decode_subscription_text(raw)
 
 
 def build_vless_outbound(uri, seen_tags):
     u = urlparse(uri)
     if u.scheme.lower() != "vless":
+        return None
+    try:
+        port = u.port
+    except ValueError:
+        return None
+    if not u.hostname or not port or not u.username:
         return None
     q = parse_qs(u.query)
     tag = unique_tag(unquote(u.fragment) if u.fragment else (u.hostname or "NODE"), seen_tags)
@@ -311,6 +499,33 @@ def build_vless_outbound(uri, seen_tags):
     fingerprint = q.get("fp", [""])[0] or "chrome"
     sni = q.get("sni", [""])[0] or q.get("servername", [""])[0]
     network = q.get("type", ["tcp"])[0]
+    security = q.get("security", [""])[0]
+
+    user = {
+        "id": unquote(u.username),
+        "encryption": q.get("encryption", ["none"])[0],
+    }
+    if flow:
+        user["flow"] = flow
+
+    stream_settings = {"network": network, "security": security}
+    if security == "reality":
+        stream_settings["realitySettings"] = {
+            "serverName": sni,
+            "fingerprint": fingerprint,
+            "publicKey": q.get("pbk", [""])[0],
+            "shortId": q.get("sid", [""])[0],
+            "spiderX": q.get("spx", ["/"])[0] or "/",
+        }
+    elif security in {"tls", "xtls"}:
+        tls_settings = {"serverName": sni, "fingerprint": fingerprint}
+        alpn = q.get("alpn", [""])[0]
+        if alpn:
+            tls_settings["alpn"] = [item.strip() for item in alpn.split(",") if item.strip()]
+        allow_insecure = q.get("allowInsecure", q.get("insecure", [""]))[0].lower()
+        if allow_insecure in {"1", "true", "yes"}:
+            tls_settings["allowInsecure"] = True
+        stream_settings["tlsSettings"] = tls_settings
 
     outbound = {
         "protocol": "vless",
@@ -318,37 +533,26 @@ def build_vless_outbound(uri, seen_tags):
             "vnext": [
                 {
                     "address": u.hostname or "",
-                    "port": u.port or 0,
-                    "users": [
-                        {
-                            "id": u.username or "",
-                            "encryption": q.get("encryption", ["none"])[0],
-                            "flow": flow,
-                        }
-                    ],
+                    "port": port,
+                    "users": [user],
                 }
             ]
         },
-        "streamSettings": {
-            "network": network,
-            "security": q.get("security", [""])[0],
-            "realitySettings": {
-                "serverName": sni,
-                "fingerprint": fingerprint,
-                "publicKey": q.get("pbk", [""])[0],
-                "shortId": q.get("sid", [""])[0],
-                "spiderX": q.get("spx", ["/"])[0] or "/",
-            },
-        },
+        "streamSettings": stream_settings,
         "tag": tag,
     }
 
     if network == "tcp":
-        outbound["streamSettings"]["tcpSettings"] = {"header": {"type": "none"}}
+        header_type = q.get("headerType", q.get("header", ["none"]))[0] or "none"
+        outbound["streamSettings"]["tcpSettings"] = {"header": {"type": header_type}}
     elif network == "ws":
-        outbound["streamSettings"]["wsSettings"] = {"path": path, "headers": {"Host": host}}
+        ws_settings = {"path": path}
+        if host:
+            ws_settings["headers"] = {"Host": host}
+        outbound["streamSettings"]["wsSettings"] = ws_settings
     elif network == "grpc":
-        outbound["streamSettings"]["grpcSettings"] = {"serviceName": path.lstrip("/")}
+        service_name = q.get("serviceName", [""])[0] or path.lstrip("/")
+        outbound["streamSettings"]["grpcSettings"] = {"serviceName": service_name}
     return outbound
 
 
@@ -365,13 +569,22 @@ def import_from_subscriptions(verbose=True):
             text = fetch_subscription_text(sub["url"])
             lines = [x.strip() for x in text.splitlines() if x.strip()]
             imported = 0
+            ignored = 0
             for line in lines:
-                node = build_vless_outbound(line, seen_tags)
+                try:
+                    node = build_vless_outbound(line, seen_tags)
+                except Exception:
+                    node = None
                 if node:
                     all_nodes.append(node)
                     imported += 1
+                else:
+                    ignored += 1
             if verbose:
-                print(f"订阅 [{sub.get('name') or '未命名'}] 已更新，导入 {imported} 个节点")
+                message = f"订阅 [{sub.get('name') or '未命名'}] 已更新，导入 {imported} 个节点"
+                if ignored:
+                    message += f"，忽略 {ignored} 条不支持或无效记录"
+                print(message)
         except urllib.error.HTTPError as e:
             print(f"订阅 [{sub.get('name') or '未命名'}] 更新失败: HTTP {e.code}")
         except Exception as e:
@@ -402,17 +615,42 @@ def outbound_to_vless_uri(node):
         user = vnext.get("users", [{}])[0]
         stream = node.get("streamSettings", {})
         reality = stream.get("realitySettings", {})
+        tls = stream.get("tlsSettings", {})
+        network = stream.get("network", "tcp")
+        security = stream.get("security", "")
         params = {
             "encryption": user.get("encryption", "none"),
-            "type": stream.get("network", "tcp"),
-            "security": stream.get("security", ""),
+            "type": network,
+            "security": security,
             "flow": user.get("flow", ""),
-            "pbk": reality.get("publicKey", ""),
-            "sid": reality.get("shortId", ""),
-            "sni": reality.get("serverName", ""),
-            "fp": reality.get("fingerprint", ""),
-            "spx": reality.get("spiderX", "/"),
         }
+        if security == "reality":
+            params.update({
+                "pbk": reality.get("publicKey", ""),
+                "sid": reality.get("shortId", ""),
+                "sni": reality.get("serverName", ""),
+                "fp": reality.get("fingerprint", ""),
+                "spx": reality.get("spiderX", "/"),
+            })
+        elif security in {"tls", "xtls"}:
+            params.update({
+                "sni": tls.get("serverName", ""),
+                "fp": tls.get("fingerprint", ""),
+                "alpn": ",".join(tls.get("alpn", [])),
+                "allowInsecure": "1" if tls.get("allowInsecure") else "",
+            })
+
+        if network == "ws":
+            ws = stream.get("wsSettings", {})
+            params["path"] = ws.get("path", "/")
+            params["host"] = ws.get("headers", {}).get("Host", "")
+        elif network == "grpc":
+            grpc = stream.get("grpcSettings", {})
+            params["serviceName"] = grpc.get("serviceName", "")
+        elif network == "tcp":
+            tcp = stream.get("tcpSettings", {})
+            params["headerType"] = tcp.get("header", {}).get("type", "none")
+
         query = "&".join([f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items() if str(v) != ""])
         return f"vless://{user.get('id','')}@{vnext.get('address','')}:{vnext.get('port',0)}?{query}#{urllib.parse.quote(tag)}"
     except Exception:
@@ -432,11 +670,12 @@ def export_v2rayn_subscription():
     if not lines:
         print("没有可导出的 vless 节点")
         return
-    raw_path = BASE_DIR / "v2rayn_subscription_raw.txt"
-    b64_path = BASE_DIR / "v2rayn_subscription.txt"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    raw_path = DATA_DIR / "v2rayn_subscription_raw.txt"
+    b64_path = DATA_DIR / "v2rayn_subscription.txt"
     raw_text = "\n".join(lines) + "\n"
-    raw_path.write_text(raw_text)
-    b64_path.write_text(base64.b64encode(raw_text.encode()).decode() + "\n")
+    atomic_write_text(raw_path, raw_text, mode=0o600)
+    atomic_write_text(b64_path, base64.b64encode(raw_text.encode()).decode() + "\n", mode=0o600)
     print("已导出 v2rayN 订阅:")
     print(f"  原始链接: {raw_path}")
     print(f"  Base64订阅: {b64_path}")
@@ -495,17 +734,32 @@ def remove_subscription(index_text):
 
 
 def set_proxy_mode(mode):
+    runtime = require_service()
+    if runtime is None:
+        cleanup_env_file()
+        clear_global_env_file()
+        print("模式切换失败，已清理代理环境变量")
+        return False
+    if not ensure_proxy_running(runtime):
+        cleanup_env_file()
+        clear_global_env_file()
+        print("模式切换失败，已清理代理环境变量，避免程序连接失效的本地代理端口")
+        return False
+
     apply_mode(mode)
     print(f"已切换模式: {MODE_LABELS.get(mode, mode)}")
+    print(f"  服务: {runtime['service']}  ● RUNNING")
+    print(f"  入站已就绪: socks5://127.0.0.1:{SOCKS_PORT}  http://127.0.0.1:{HTTP_PORT}")
     if mode == "inbound":
         print(f"  仅监听本地入站: socks5://127.0.0.1:{SOCKS_PORT}  http://127.0.0.1:{HTTP_PORT}")
         print("  不写入 shell / 系统环境变量")
     elif mode == "outbound":
-        print("  写入 shell 环境变量: /etc/profile.d/xray-proxy.sh")
-        print("  当前 shell 需执行: source /etc/profile.d/xray-proxy.sh")
+        print(f"  写入 shell 环境变量: {PROXY_SH}")
+        print(f"  当前 shell 需执行: source {PROXY_SH}")
     elif mode == "global":
-        print("  写入 shell 环境变量 + /etc/environment")
+        print(f"  写入 shell 环境变量: {PROXY_SH} + {ENV_FILE}")
         print("  新登录 shell / 会话会自动带代理环境变量")
+    return True
 
 
 def list_nodes():
@@ -558,6 +812,18 @@ def require_service():
     return runtime
 
 
+def restart_service_if_available():
+    runtime = detect_runtime()
+    try:
+        result = run(["systemctl", "cat", runtime["service"]], timeout=8)
+    except Exception:
+        result = None
+    if result is None or result.returncode != 0:
+        print("配置已保存；当前未检测到可用服务，可安装 Xray/V2Ray 后执行: proxy on")
+        return True
+    return restart_proxy_service(runtime)
+
+
 
 def switch_node(tag):
     runtime = require_service()
@@ -569,37 +835,74 @@ def switch_node(tag):
         print(f"未知节点: {tag}")
         print(f"可用节点: {', '.join(valid_tags)}")
         sys.exit(1)
+    old_routing = cfg.get("routing", {})
     cfg["routing"] = {
         "domainStrategy": "IPIfNonMatch",
         "rules": [{"type": "field", "outboundTag": tag, "port": "0-65535"}],
     }
     save_config(cfg)
-    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
-    time.sleep(0.5)
+    if not restart_proxy_service(runtime):
+        cfg["routing"] = old_routing
+        save_config(cfg)
+        restart_proxy_service(runtime, verify=False)
+        print("节点切换失败，已恢复原路由配置")
+        return False
     print(f"已切换到 [{tag}]")
     print("  仅入站模式不会自动检测代理出口 IP；如需测试节点出口，请手动执行: proxy 0")
+    return True
 
 
 def start_proxy():
     runtime = require_service()
     if runtime is None:
-        return
+        cleanup_env_file()
+        clear_global_env_file()
+        print("代理启动失败，已清理代理环境变量")
+        return False
+    if not ensure_proxy_running(runtime):
+        cleanup_env_file()
+        clear_global_env_file()
+        print("代理启动失败，已清理代理环境变量")
+        return False
     apply_mode(get_mode())
-    subprocess.run(["systemctl", "enable", runtime["service"], "--now"], capture_output=True, timeout=15)
     print("代理已启动")
     print(f"  当前模式: {MODE_LABELS.get(get_mode(), get_mode())}")
     print(f"  服务: {runtime['service']}  |  配置: {runtime['config_file']}")
     print(f"  本地监听: socks5://127.0.0.1:{SOCKS_PORT}  http://127.0.0.1:{HTTP_PORT}")
+    return True
 
 
 def stop_proxy():
     runtime = detect_runtime()
-    subprocess.run(["systemctl", "stop", runtime["service"]], capture_output=True, timeout=15)
-    subprocess.run(["systemctl", "disable", runtime["service"]], capture_output=True, timeout=15)
+    service = runtime["service"]
+    try:
+        unit = run(["systemctl", "cat", service], timeout=8)
+    except Exception:
+        unit = None
+    if unit is None or unit.returncode != 0:
+        cleanup_env_file()
+        clear_global_env_file()
+        print("未检测到代理服务，已清理 shell / 系统代理环境变量")
+        return True
+
+    errors = []
+    for action in ("stop", "disable"):
+        try:
+            result = run(["systemctl", action, service], timeout=15)
+            if result.returncode != 0:
+                errors.append(f"systemctl {action}: {command_error(result)}")
+        except Exception as e:
+            errors.append(f"systemctl {action}: {type(e).__name__}: {e}")
     cleanup_env_file()
     clear_global_env_file()
+    if errors:
+        print("代理环境变量已清理，但服务停止/禁用存在错误:")
+        for error in errors:
+            print(f"  - {error}")
+        return False
     print("代理已停止")
     print("  已关闭本地监听，并清理 shell / 系统代理环境变量")
+    return True
 
 
 
@@ -724,15 +1027,21 @@ def test_node(tag):
         "rules": [{"type": "field", "outboundTag": tag, "port": "0-65535"}],
     }
     save_config(cfg)
-    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
-    time.sleep(1)
+    if not restart_proxy_service(runtime):
+        cfg["routing"] = old_routing
+        save_config(cfg)
+        restart_proxy_service(runtime, verify=False)
+        print("  临时节点测试启动失败，已恢复原节点")
+        return False
     try:
-        test_proxy_ip(tag)
+        return test_proxy_ip(tag)
     finally:
         cfg["routing"] = old_routing
         save_config(cfg)
-        subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
-        print("  已恢复原节点")
+        if restart_proxy_service(runtime):
+            print("  已恢复原节点")
+        else:
+            print("  原节点配置已写回，但服务重启失败，请检查日志")
 
 
 
@@ -909,8 +1218,8 @@ def check_system_proxy():
     proc_env = {k: v for k, v in os.environ.items() if k.lower() in {"http_proxy", "https_proxy", "all_proxy"}}
 
     print(f"  模式文件: {MODE_LABELS.get(get_mode(), get_mode())}")
-    print(f"  /etc/profile.d/xray-proxy.sh: {'存在' if profile_exists else '不存在'}")
-    print(f"  /etc/environment 代理变量: {len(env_lines)} 条")
+    print(f"  {PROXY_SH}: {'存在' if profile_exists else '不存在'}")
+    print(f"  {ENV_FILE} 代理变量: {len(env_lines)} 条")
     print(f"  当前进程代理环境变量: {len(proc_env)} 条")
 
     if profile_exists or env_lines or proc_env:
@@ -918,7 +1227,7 @@ def check_system_proxy():
         if profile_exists:
             print(f"    - {PROXY_SH}")
         for line in env_lines:
-            print(f"    - /etc/environment: {line}")
+            print(f"    - {ENV_FILE}: {line}")
         for k, v in sorted(proc_env.items()):
             print(f"    - env: {k}={v}")
     else:
@@ -928,7 +1237,8 @@ def check_system_proxy():
 
 def install_official_xray():
     url = "https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-    tmp = BASE_DIR / f".install_xray_{int(time.time())}.sh"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DATA_DIR / f".install_xray_{int(time.time())}.sh"
     print("开始下载官方 Xray 安装脚本...")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -965,10 +1275,8 @@ def main():
 
         if cmd == "000":
             ok = import_from_subscriptions(verbose=True)
-            if ok:
-                runtime = require_service()
-                if runtime:
-                    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+            if not ok or not restart_service_if_available():
+                sys.exit(1)
             i += 1
         elif cmd == "001":
             list_subscriptions()
@@ -978,10 +1286,13 @@ def main():
                 print("用法: proxy 002 <订阅编号>")
                 sys.exit(1)
             ok = remove_subscription(args[i + 1])
-            if ok:
-                runtime = require_service()
-                if runtime:
-                    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+            if not ok:
+                sys.exit(1)
+            if get_nodes():
+                if not restart_service_if_available():
+                    sys.exit(1)
+            elif not stop_proxy():
+                sys.exit(1)
             i += 2
         elif cmd == "00":
             if i + 1 >= len(args):
@@ -996,19 +1307,20 @@ def main():
                     name = args[i + 2]
                     consumed = 3
             ok = add_subscription(url, name)
-            if ok:
-                runtime = require_service()
-                if runtime:
-                    subprocess.run(["systemctl", "restart", runtime["service"]], capture_output=True, timeout=15)
+            if not ok or not restart_service_if_available():
+                sys.exit(1)
             i += consumed
         elif cmd == "01":
-            set_proxy_mode("inbound")
+            if not set_proxy_mode("inbound"):
+                sys.exit(1)
             i += 1
         elif cmd == "02":
-            set_proxy_mode("outbound")
+            if not set_proxy_mode("outbound"):
+                sys.exit(1)
             i += 1
         elif cmd == "03":
-            set_proxy_mode("global")
+            if not set_proxy_mode("global"):
+                sys.exit(1)
             i += 1
         elif cmd == "04":
             install_official_xray()
@@ -1026,10 +1338,12 @@ def main():
             check_system_proxy()
             i += 1
         elif cmd in ("off", "stop"):
-            stop_proxy()
+            if not stop_proxy():
+                sys.exit(1)
             i += 1
         elif cmd in ("on", "start"):
-            start_proxy()
+            if not start_proxy():
+                sys.exit(1)
             i += 1
         elif cmd == "test":
             if i + 1 >= len(args):
@@ -1039,7 +1353,8 @@ def main():
             if tag is None:
                 print(f"无效参数: {args[i + 1]}")
                 sys.exit(1)
-            test_node(tag)
+            if not test_node(tag):
+                sys.exit(1)
             i += 2
         else:
             tag = resolve_tag(cmd)
@@ -1049,7 +1364,8 @@ def main():
                 print(f"未知: {cmd}")
                 print(f"可用: 000 / 00 / 001 / 002 / 01 / 02 / 03 / 04 / 05 / 0 / 序号 1-{len(nodes)} / {', '.join(valid_tags)}")
                 sys.exit(1)
-            switch_node(tag)
+            if not switch_node(tag):
+                sys.exit(1)
             i += 1
 
 
